@@ -20,7 +20,6 @@ except ImportError:
 from .target_parser import TargetParser, _is_valid_unicast_ip
 from .relay_analyzer import RelayAnalyzer
 from .port_scanner import FastPortScanner
-from .creds_checker import CredentialChecker ## added
 from protocols.smb_detector import SMBDetector
 from protocols.http_detector import HTTPDetector, HTTPSDetector
 from protocols.ldap_detector import LDAPDetector, LDAPSDetector
@@ -68,188 +67,150 @@ class RelayKingScanner:
         self.target_parser = TargetParser(config)
         # RelayAnalyzer is initialized later after target parsing to get tier-0 assets
         self.relay_analyzer = None
-        self.cred_checker = CredentialChecker(config)
-        self.all_targets = []
 
-    def prepare(self) -> Dict:
-        """
-        Prepare for scan
-            - check credential
-            - prepare target list
-
-        Returns:
-            dict with status, details and number_of_target
-        """
-
-        # Check if given credential is valid
-        creds_status = self.cred_checker.check_creds()
-        if(creds_status['status'] != "success"):
-            print(f"[*] Given credential looks invalid: {creds_status['error']}\nExitting ...")
-            return {
-                'status': "Invalid_credential",
-                'details': creds_status['error'],
-                'number_of_target': 0
-            }
-        else:
-            print("[*] Given credential looks valid. Good to move forward")
-
-        # Parse targets
-        print("[*] Parsing targets...")
-        self.all_targets = self.target_parser.parse_targets()
-
-        if not self.all_targets:
-            print("[!] No targets to scan")
-            return {
-                'status': "No target to scan",
-                'details': "",
-                'number_of_target': 0
-            }
-
-        print(f"[+] Found {len(self.all_targets)} target(s)")
-        return {
-            'status': "Success",
-            'details': "",
-            'number_of_target': len(self.all_targets)
-        }
-
-    def scan(self, start_idx, end_idx) -> Dict:
+    def scan(self) -> Dict:
         """
         Run the scan
 
         Returns:
             dict with all results, analysis, and statistics
         """
-
-
         # Special mode: --coerce-all (only coerce, no protocol scanning)
         if self.config.coerce_all:
-            return self._coerce_all_mode(start_idx, end_idx)
+            return self._coerce_all_mode()
+
+        # Parse targets
+        print("[*] Parsing targets...")
+        targets = self.target_parser.parse_targets()
+
+        if not targets:
+            print("[!] No targets to scan")
+            return {
+                'targets': [],
+                'results': {},
+                'analysis': {},
+                'config': self._get_config_summary()
+            }
+
+        print(f"[+] Found {len(targets)} target(s)")
 
         # Initialize RelayAnalyzer with tier-0 assets from target parsing
         self.relay_analyzer = RelayAnalyzer(self.config, self.target_parser.tier0_assets)
 
-        targets = self.all_targets[start_idx:end_idx]
-        analysis = self.relay_analyzer.skeleton()
-        all_results = {}
+        # Determine which protocols to scan
+        protocols = self.config.protocols if self.config.protocols else self.DEFAULT_PROTOCOLS
 
-        try:
+        # Ensure SMB is always scanned when not in null-auth mode (required for NTLM reflection detection)
+        if not self.config.null_auth and 'smb' not in protocols:
+            protocols = protocols.copy()  # Don't modify the original
+            protocols.insert(0, 'smb')  # Add SMB at the beginning
 
-            # Determine which protocols to scan
-            protocols = self.config.protocols if self.config.protocols else self.DEFAULT_PROTOCOLS
+        print(f"[*] Scanning protocols: {', '.join(protocols)}")
+        if self.config.protocols is None and not self.config.null_auth:
+            print(f"[*] Note: HTTP/HTTPS will be scanned on tier-0 assets only")
+        elif self.config.protocols is not None:
+            # User explicitly specified protocols - check if HTTP/HTTPS included
+            if 'http' in protocols or 'https' in protocols:
+                print(f"[!] WARNING: HTTP/HTTPS path enumeration enabled - scan will take significantly longer")
+                print(f"[*] Each HTTP/HTTPS host will be scanned against ~50 NTLM-enabled paths")
+        print(f"[*] Using {self.config.threads} threads")
+        print()
 
-            # Ensure SMB is always scanned when not in null-auth mode (required for NTLM reflection detection)
-            if not self.config.null_auth and 'smb' not in protocols:
-                protocols = protocols.copy()  # Don't modify the original
-                protocols.insert(0, 'smb')  # Add SMB at the beginning
+        # Fast port scan if --proto-portscan enabled
+        port_scan_results = {}
+        if self.config.proto_portscan:
+            print("[*] Running fast port scan...")
+            port_scanner = FastPortScanner(timeout=0.1)  # 100ms timeout
 
-            print(f"[*] Scanning protocols: {', '.join(protocols)}")
-            if self.config.protocols is None and not self.config.null_auth:
-                print(f"[*] Note: HTTP/HTTPS will be scanned on tier-0 assets only")
-            elif self.config.protocols is not None:
-                # User explicitly specified protocols - check if HTTP/HTTPS included
-                if 'http' in protocols or 'https' in protocols:
-                    print(f"[!] WARNING: HTTP/HTTPS path enumeration enabled - scan will take significantly longer")
-                    print(f"[*] Each HTTP/HTTPS host will be scanned against ~50 NTLM-enabled paths")
-            print(f"[*] Using {self.config.threads} threads")
+            # Determine which protocols to port scan
+            # Always include HTTP/HTTPS ports when tier-0 assets exist (for ADCS/SCCM detection)
+            protocols_for_portscan = protocols.copy()
+            if self.target_parser.tier0_assets:
+                # Add HTTP/HTTPS to port scan for tier-0 asset detection
+                if 'http' not in protocols_for_portscan:
+                    protocols_for_portscan.append('http')
+                if 'https' not in protocols_for_portscan:
+                    protocols_for_portscan.append('https')
+
+            # First pass: scan all targets for base protocols
+            port_scan_results = port_scanner.scan_hosts(targets, protocols_for_portscan, threads=50)
+
+            # Count open ports
+            total_open = sum(len(ports) for ports in port_scan_results.values())
+            hosts_with_open = sum(1 for ports in port_scan_results.values() if ports)
+            print(f"[+] Port scan complete: {total_open} open ports across {hosts_with_open} hosts")
             print()
 
-            # Fast port scan if --proto-portscan enabled
-            port_scan_results = {}
-            if self.config.proto_portscan:
-                print("[*] Running fast port scan...")
-                port_scanner = FastPortScanner(timeout=0.1)  # 100ms timeout
+        # Scan all targets
+        all_results = {}
 
-                # Determine which protocols to port scan
-                # Always include HTTP/HTTPS ports when tier-0 assets exist (for ADCS/SCCM detection)
-                protocols_for_portscan = protocols.copy()
-                if self.target_parser.tier0_assets:
-                    # Add HTTP/HTTPS to port scan for tier-0 asset detection
-                    if 'http' not in protocols_for_portscan:
-                        protocols_for_portscan.append('http')
-                    if 'https' not in protocols_for_portscan:
-                        protocols_for_portscan.append('https')
+        with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
+            # Submit all scan tasks
+            future_to_target = {}
 
-                # First pass: scan all targets for base protocols
-                port_scan_results = port_scanner.scan_hosts(targets, protocols_for_portscan, threads=50)
+            for target in targets:
+                future = executor.submit(self._scan_target, target, protocols, port_scan_results)
+                future_to_target[future] = target
 
-                # Count open ports
-                total_open = sum(len(ports) for ports in port_scan_results.values())
-                hosts_with_open = sum(1 for ports in port_scan_results.values() if ports)
-                print(f"[+] Port scan complete: {total_open} open ports across {hosts_with_open} hosts")
-                print()
+            # Process results as they complete
+            completed = 0
+            for future in as_completed(future_to_target):
+                target = future_to_target[future]
+                completed += 1
 
-            # Scan all targets
+                try:
+                    result = future.result()
 
-            with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
-                # Submit all scan tasks
-                future_to_target = {}
+                    # Resolve target IP and add to results
+                    resolved_ips = self._resolve_target_ip(target)
+                    result['_target_ips'] = resolved_ips  # Store IPs with underscore prefix to mark as metadata
 
-                for target in targets:
-                    future = executor.submit(self._scan_target, target, protocols, port_scan_results)
-                    future_to_target[future] = target
+                    all_results[target] = result
 
-                # Process results as they complete
-                completed = 0
-                for future in as_completed(future_to_target):
-                    target = future_to_target[future]
-                    completed += 1
+                    # Print progress
+                    if self.config.verbose >= 1:
+                        # Check if any protocol was actually available
+                        has_available = any(
+                            hasattr(pr, 'available') and pr.available
+                            for pr in result.values()
+                            if not isinstance(pr, dict)
+                        )
 
-                    try:
-                        result = future.result()
-
-                        # Resolve target IP and add to results
-                        resolved_ips = self._resolve_target_ip(target)
-                        result['_target_ips'] = resolved_ips  # Store IPs with underscore prefix to mark as metadata
-
-                        all_results[target] = result
-
-                        # Print progress
-                        if self.config.verbose >= 1:
-                            # Check if any protocol was actually available
-                            has_available = any(
-                                hasattr(pr, 'available') and pr.available
-                                for pr in result.values()
-                                if not isinstance(pr, dict)
+                        if has_available:
+                            # Only show status if we could actually connect
+                            relayable = any(
+                                pr.is_relayable() for pr in result.values()
+                                if hasattr(pr, 'is_relayable')
                             )
-
-                            if has_available:
-                                # Only show status if we could actually connect
-                                relayable = any(
-                                    pr.is_relayable() for pr in result.values()
-                                    if hasattr(pr, 'is_relayable')
-                                )
-                                status = "RELAYABLE" if relayable else "PROTECTED"
-                                print(f"[{completed}/{len(targets)}] {target}: {status}")
-                            else:
-                                # Skip hosts where we couldn't connect to any protocol
-                                pass
+                            status = "RELAYABLE" if relayable else "PROTECTED"
+                            print(f"[{completed}/{len(targets)}] {target}: {status}")
                         else:
-                            sys.stdout.write(f"\r[*] Progress: {completed}/{len(targets)}")
-                            sys.stdout.flush()
+                            # Skip hosts where we couldn't connect to any protocol
+                            pass
+                    else:
+                        sys.stdout.write(f"\r[*] Progress: {completed}/{len(targets)}")
+                        sys.stdout.flush()
 
-                    except Exception as e:
-                        if self.config.verbose >= 1:
-                            print(f"[!] Error scanning {target}: {e}")
+                except Exception as e:
+                    if self.config.verbose >= 1:
+                        print(f"[!] Error scanning {target}: {e}")
 
-            if self.config.verbose == 0:
-                print()  # Newline after progress
+        if self.config.verbose == 0:
+            print()  # Newline after progress
 
-            # Check for NTLMv1 support first (before analysis)
-            ntlmv1_analysis = None
-            if self.config.check_ntlmv1 or self.config.check_ntlmv1_all:
-                print("\n[*] Checking for NTLMv1 support...")
-                ntlmv1_analysis = self._check_ntlmv1(targets, all_results)
+        # Check for NTLMv1 support first (before analysis)
+        ntlmv1_analysis = None
+        if self.config.check_ntlmv1 or self.config.check_ntlmv1_all:
+            print("\n[*] Checking for NTLMv1 support...")
+            ntlmv1_analysis = self._check_ntlmv1(targets, all_results)
 
-            # Run analysis
-            print("[*] Analyzing results...")
-            analysis = self.relay_analyzer.analyze(all_results, ntlmv1_analysis)
+        # Run analysis
+        print("[*] Analyzing results...")
+        analysis = self.relay_analyzer.analyze(all_results, ntlmv1_analysis)
 
-            if self.config.check_coercion:
-                print("[*] Checking for coercion vulnerabilities...")
-                analysis['coercion'] = self._check_coercion(targets)
-
-        except KeyboardInterrupt:
-            print("\n[!] Scan interrupted by user")
+        if self.config.check_coercion:
+            print("[*] Checking for coercion vulnerabilities...")
+            analysis['coercion'] = self._check_coercion(targets)
 
         # Compile final results
         final_results = {
@@ -261,7 +222,7 @@ class RelayKingScanner:
 
         return final_results
 
-    def _coerce_all_mode(self, start_idx, end_idx) -> Dict:
+    def _coerce_all_mode(self) -> Dict:
         """
         Special mode: --coerce-all
         Enumerate AD computers and coerce them all to authenticate to listener
@@ -269,70 +230,63 @@ class RelayKingScanner:
         print("[*] Coerce-All Mode: Enumerating computers from Active Directory...")
 
         # Use target parser to enumerate AD (it already has this logic)
-        #targets = self.target_parser.parse_targets()
-        targets = self.all_targets[start_idx:end_idx]
+        targets = self.target_parser.parse_targets()
 
-        result = {
+        if not targets:
+            print("[!] No targets found in Active Directory")
+            return {
                 'targets': [],
                 'coercion_count': 0,
                 'listener': self.config.coerce_target,
                 'config': self._get_config_summary()
-        }
-        if not targets:
-            print("[!] No targets found in Active Directory")
-            return result
+            }
 
         print(f"[+] Found {len(targets)} target(s)")
         print(f"[*] Initiating coercion attacks to {self.config.coerce_target}...")
 
-        try:
-            # Import coercion detector
-            from detectors.coercion import CoercionDetector
-            coercion_detector = CoercionDetector(self.config)
+        # Import coercion detector
+        from detectors.coercion import CoercionDetector
+        coercion_detector = CoercionDetector(self.config)
 
-            # Run coercion on all targets
-            completed = 0
-            with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
-                future_to_target = {}
+        # Run coercion on all targets
+        completed = 0
+        with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
+            future_to_target = {}
 
-                for target in targets:
-                    future = executor.submit(coercion_detector.detect, target)
-                    future_to_target[future] = target
+            for target in targets:
+                future = executor.submit(coercion_detector.detect, target)
+                future_to_target[future] = target
 
-                for future in as_completed(future_to_target):
-                    target = future_to_target[future]
-                    completed += 1
+            for future in as_completed(future_to_target):
+                target = future_to_target[future]
+                completed += 1
 
-                    try:
-                        result = future.result()
+                try:
+                    result = future.result()
 
-                        # Show progress
-                        if self.config.verbose >= 1:
-                            print(f"[{completed}/{len(targets)}] Coerced: {target}")
-                        else:
-                            sys.stdout.write(f"\r[*] Coercion progress: {completed}/{len(targets)}")
-                            sys.stdout.flush()
+                    # Show progress
+                    if self.config.verbose >= 1:
+                        print(f"[{completed}/{len(targets)}] Coerced: {target}")
+                    else:
+                        sys.stdout.write(f"\r[*] Coercion progress: {completed}/{len(targets)}")
+                        sys.stdout.flush()
 
-                    except Exception as e:
-                        if self.config.verbose >= 2:
-                            print(f"[!] Error coercing {target}: {e}")
+                except Exception as e:
+                    if self.config.verbose >= 2:
+                        print(f"[!] Error coercing {target}: {e}")
 
-                if self.config.verbose == 0:
-                    print()  # Newline after progress
+            if self.config.verbose == 0:
+                print()  # Newline after progress
 
-            # Final summary
-            print(f"\n[+] Coercion complete. All {len(targets)} targets should have initiated computer account connections to {self.config.coerce_target}")
+        # Final summary
+        print(f"\n[+] Coercion complete. All {len(targets)} targets should have initiated computer account connections to {self.config.coerce_target}")
 
-            return {
-                'targets': targets,
-                'coercion_count': len(targets),
-                'listener': self.config.coerce_target,
-                'config': self._get_config_summary()
-            }
-        except KeyboardInterrupt:
-            print("\n[!] Scan interrupted by user")
-            return result
-
+        return {
+            'targets': targets,
+            'coercion_count': len(targets),
+            'listener': self.config.coerce_target,
+            'config': self._get_config_summary()
+        }
 
     def _scan_target(self, target: str, protocols: List[str], port_scan_results: Dict = None) -> Dict:
         """Scan a single target for all specified protocols"""
