@@ -29,75 +29,65 @@ class CredentialChecker:
             'error': None
         }
 
-        try:
-            ## domain controller: 
-            dc_host = ""
-            if(self.config.dc_ip != None):
-                dc_host = self.config.dc_ip
-            else:
-                dc_host = self.config.domain
-            print(f"[*] Checking given credentials against domain controller [{dc_host}] ... ")
+        dc_host = self.config.dc_ip if self.config.dc_ip is not None else self.config.domain
+        print(f"[*] Checking given credentials against domain controller [{dc_host}] ... ")
 
+        last_error = None
+        for proto in ('ldap', 'ldaps'):
+            try:
+                ldap_url = f"{proto}://{dc_host}"
+                ldap_conn = ldap_impacket.LDAPConnection(url=ldap_url, baseDN=self.config.domain, dstIp=dc_host)
 
-            # Query LDAP for GPO settings
-            # The LmCompatibilityLevel can be set via GPO at:
-            # Computer Configuration -> Windows Settings -> Security Settings -> Local Policies -> Security Options
-            # "Network security: LAN Manager authentication level"
-
-            ldap_url = f"ldap://{dc_host}"
-            ldap_conn = ldap_impacket.LDAPConnection(url=ldap_url, baseDN=self.config.domain, dstIp=dc_host)
-
-            # Authenticate using Kerberos if specified, otherwise NTLM
-            # For GPO check, dc_host IS a DC so use should_use_kerberos
-            if self.config.should_use_kerberos(dc_host):
-                # Use uppercase domain for Kerberos realm matching, useCache for ccache
-                krb_domain = (self.config.domain or '').upper()
-                try:
-                    ldap_conn.kerberosLogin(
+                if self.config.should_use_kerberos(dc_host):
+                    krb_domain = (self.config.domain or '').upper()
+                    try:
+                        ldap_conn.kerberosLogin(
+                            user=self.config.username,
+                            password=self.config.password or '',
+                            domain=krb_domain,
+                            lmhash=self.config.lmhash or '',
+                            nthash=self.config.nthash or '',
+                            aesKey=self.config.aesKey,
+                            kdcHost=self.config.dc_ip,
+                            useCache=True
+                        )
+                    except Exception as krb_err:
+                        krb_error = str(krb_err).lower()
+                        if 'kdc' in krb_error or 'kerberos' in krb_error or 'krb' in krb_error:
+                            result['error'] = f'Kerberos auth failed: {krb_err}'
+                            return result
+                        raise
+                else:
+                    ldap_conn.login(
                         user=self.config.username,
-                        password=self.config.password or '',
-                        domain=krb_domain,
+                        password=self.config.password,
+                        domain=self.config.domain or '',
                         lmhash=self.config.lmhash or '',
-                        nthash=self.config.nthash or '',
-                        aesKey=self.config.aesKey,
-                        kdcHost=self.config.dc_ip,
-                        useCache=True
+                        nthash=self.config.nthash or ''
                     )
-                except Exception as krb_err:
-                    # Handle Kerberos-specific errors - do NOT retry
-                    # This prevents account lockouts from repeated auth failures
-                    krb_error = str(krb_err).lower()
-                    if 'kdc' in krb_error or 'kerberos' in krb_error or 'krb' in krb_error:
-                        result['error'] = f'Kerberos auth failed: {krb_err}'
-                        return result
-                    raise
-            else:
-                ldap_conn.login(
-                    user=self.config.username,
-                    password=self.config.password,
-                    domain=self.config.domain or '',
-                    lmhash=self.config.lmhash or '',
-                    nthash=self.config.nthash or ''
+
+                ldap_conn.search(
+                    searchBase=f"CN=Policies,CN=System,{self._get_base_dn()}",
+                    searchFilter="(objectClass=groupPolicyContainer)",
+                    attributes=['displayName', 'gPCFileSysPath'],
+                    scope=ldapasn1_impacket.Scope('wholeSubtree')
                 )
 
-            # Search for GPO objects with NTLMv1 settings
-            # Look in Default Domain Policy and Default Domain Controllers Policy
-            search_filter = "(objectClass=groupPolicyContainer)"
+                result['status'] = "success"
+                result['error'] = "None"
+                return result
 
-            resp = ldap_conn.search(
-                searchBase=f"CN=Policies,CN=System,{self._get_base_dn()}",
-                searchFilter=search_filter,
-                attributes=['displayName', 'gPCFileSysPath'],
-                scope=ldapasn1_impacket.Scope('wholeSubtree')
-            )
+            except Exception as e:
+                err_str = str(e)
+                last_error = err_str
+                # 80090346 = SEC_E_BAD_BINDINGS: channel binding required.
+                # Retry with LDAPS so impacket can negotiate CBT over TLS.
+                if '80090346' in err_str and proto == 'ldap':
+                    continue
+                result['error'] = err_str
+                return result
 
-            # Note: Connected
-            result['status'] = "success"
-            result['error'] = "None"
-
-        except Exception as e:
-            result['error'] = str(e)
-
+        result['error'] = last_error
         return result
 
 

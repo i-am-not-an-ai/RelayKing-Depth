@@ -88,7 +88,7 @@ class RelayKingScanner:
 
         # Check if given credential is valid
         creds_status = self.cred_checker.check_creds()
-        if(creds_status['status'] != "success"):
+        if creds_status['status'] != "success":
             print(f"[*] Given credential looks invalid: {creds_status['error']}\nExitting ...")
             return {
                 'status': "Invalid_credential",

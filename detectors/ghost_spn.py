@@ -158,49 +158,68 @@ class GhostSPNDetector:
     # ──────────────────────────────────────────────────────────────
 
     def _connect_ldap(self, dc_ip: str) -> Tuple:
-        """Establish LDAP connection. Returns (conn, use_impacket, search_base)."""
+        """Establish LDAP connection. Returns (conn, use_impacket, search_base).
+        Retries with LDAPS when the DC enforces channel binding (SEC_E_BAD_BINDINGS)."""
         search_base = ''
         if self.config.domain:
             search_base = ','.join(f"DC={part}" for part in self.config.domain.split('.'))
 
-        ldap_port = 636 if self.config.use_ldaps else 389
+        use_ldaps = self.config.use_ldaps
 
         if self.config.use_kerberos or self.config.nthash:
             from impacket.ldap import ldap as ldap_impacket
-            ldap_url = f"{'ldaps' if self.config.use_ldaps else 'ldap'}://{dc_ip}"
-            conn = ldap_impacket.LDAPConnection(url=ldap_url, baseDN=self.config.domain, dstIp=dc_ip)
 
-            if self.config.use_kerberos:
-                krb_domain = self.config.domain.upper() if self.config.domain else ''
-                conn.kerberosLogin(
-                    user=self.config.username,
-                    password=self.config.password or '',
-                    domain=krb_domain,
-                    lmhash=self.config.lmhash or '',
-                    nthash=self.config.nthash or '',
-                    aesKey=self.config.aesKey,
-                    kdcHost=self.config.dc_ip,
-                    useCache=True,
-                )
-            else:
-                conn.login(
-                    user=self.config.username,
-                    password='',
-                    domain=self.config.domain,
-                    lmhash=self.config.lmhash or '',
-                    nthash=self.config.nthash,
-                )
-            return conn, True, search_base
+            for proto in (['ldaps'] if use_ldaps else ['ldap', 'ldaps']):
+                try:
+                    ldap_url = f"{proto}://{dc_ip}"
+                    conn = ldap_impacket.LDAPConnection(url=ldap_url, baseDN=self.config.domain, dstIp=dc_ip)
+
+                    if self.config.use_kerberos:
+                        krb_domain = self.config.domain.upper() if self.config.domain else ''
+                        conn.kerberosLogin(
+                            user=self.config.username,
+                            password=self.config.password or '',
+                            domain=krb_domain,
+                            lmhash=self.config.lmhash or '',
+                            nthash=self.config.nthash or '',
+                            aesKey=self.config.aesKey,
+                            kdcHost=self.config.dc_ip,
+                            useCache=True,
+                        )
+                    else:
+                        conn.login(
+                            user=self.config.username,
+                            password='',
+                            domain=self.config.domain,
+                            lmhash=self.config.lmhash or '',
+                            nthash=self.config.nthash,
+                        )
+                    return conn, True, search_base
+
+                except Exception as e:
+                    if '80090346' in str(e) and proto == 'ldap':
+                        continue
+                    raise
 
         # NTLM password auth via ldap3
-        from ldap3 import Server, Connection, NTLM, ALL
-        server = Server(dc_ip, port=ldap_port, use_ssl=self.config.use_ldaps, get_info=ALL)
+        import ssl
+        from ldap3 import Server, Connection, NTLM, ALL, Tls
+
         user = f"{self.config.domain}\\{self.config.username}"
-        conn = Connection(
-            server, user=user, password=self.config.password,
-            authentication=NTLM, auto_bind=True, auto_referrals=False,
-        )
-        return conn, False, search_base
+        for use_ssl, port in ([(True, 636)] if use_ldaps else [(False, 389), (True, 636)]):
+            try:
+                tls_config = Tls(validate=ssl.CERT_NONE) if use_ssl else None
+                server = Server(dc_ip, port=port, use_ssl=use_ssl, tls=tls_config, get_info=ALL)
+                conn = Connection(
+                    server, user=user, password=self.config.password,
+                    authentication=NTLM, auto_bind=True, auto_referrals=False,
+                )
+                return conn, False, search_base
+
+            except Exception as e:
+                if '80090346' in str(e) and not use_ssl:
+                    continue
+                raise
 
     def _check_wildcard_dns(self, conn, search_base: str, use_impacket: bool) -> bool:
         """Return True if any wildcard DNS entry exists in DomainDnsZones."""
