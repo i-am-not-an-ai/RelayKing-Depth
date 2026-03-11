@@ -243,33 +243,51 @@ class TargetParser:
 
                     print("[*] Using NTLM pass-the-hash authentication for AD enumeration...")
 
-                    ldap_url = f"{'ldaps' if self.config.use_ldaps else 'ldap'}://{dc_ip}"
-                    impacket_conn = ldap_impacket.LDAPConnection(url=ldap_url, baseDN=self.config.domain, dstIp=dc_ip)
-
-                    # NTLM login with hash via impacket
-                    impacket_conn.login(
-                        user=self.config.username,
-                        password='',
-                        domain=self.config.domain,
-                        lmhash=self.config.lmhash or '',
-                        nthash=self.config.nthash
-                    )
+                    protos = ['ldaps'] if self.config.use_ldaps else ['ldap', 'ldaps']
+                    impacket_conn = None
+                    for proto in protos:
+                        try:
+                            ldap_url = f"{proto}://{dc_ip}"
+                            impacket_conn = ldap_impacket.LDAPConnection(url=ldap_url, baseDN=self.config.domain, dstIp=dc_ip)
+                            impacket_conn.login(
+                                user=self.config.username,
+                                password='',
+                                domain=self.config.domain,
+                                lmhash=self.config.lmhash or '',
+                                nthash=self.config.nthash
+                            )
+                            break
+                        except Exception as e:
+                            if '80090346' in str(e) and proto == 'ldap':
+                                continue
+                            raise
 
                     conn = impacket_conn
                     use_impacket = True
                 else:
                     # Use ldap3 library for simpler LDAP queries with NTLM (password auth)
-                    from ldap3 import Server, Connection, NTLM, ALL, SUBTREE
+                    import ssl
+                    from ldap3 import Server, Connection, NTLM, ALL, SUBTREE, Tls
 
-                    server = Server(dc_ip, port=ldap_port, use_ssl=self.config.use_ldaps, get_info=ALL)
-
-                    # Build credentials
-                    if self.config.null_auth:
-                        conn = Connection(server, auto_bind=True, auto_referrals=False)
-                    else:
-                        user = f"{self.config.domain}\\{self.config.username}"
-                        conn = Connection(server, user=user, password=self.config.password,
-                                        authentication=NTLM, auto_bind=True, auto_referrals=False)
+                    # Try plain LDAP first; if DC enforces channel binding (80090346),
+                    # retry with LDAPS so the CBT can be negotiated over TLS.
+                    candidates = [(False, 389), (True, 636)] if not self.config.use_ldaps else [(True, 636)]
+                    conn = None
+                    for use_ssl, port in candidates:
+                        try:
+                            tls_config = Tls(validate=ssl.CERT_NONE) if use_ssl else None
+                            server = Server(dc_ip, port=port, use_ssl=use_ssl, tls=tls_config, get_info=ALL)
+                            if self.config.null_auth:
+                                conn = Connection(server, auto_bind=True, auto_referrals=False)
+                            else:
+                                user = f"{self.config.domain}\\{self.config.username}"
+                                conn = Connection(server, user=user, password=self.config.password,
+                                                authentication=NTLM, auto_bind=True, auto_referrals=False)
+                            break
+                        except Exception as e:
+                            if '80090346' in str(e) and not use_ssl:
+                                continue
+                            raise
                     use_impacket = False
 
                 # Build search base from domain
