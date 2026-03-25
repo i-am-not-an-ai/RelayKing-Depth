@@ -49,7 +49,7 @@ See the associated blog released on the Depth Security website for more details:
 # Clone repo:
 git clone https://github.com/depthsecurity/RelayKing-Depth.git
 #Navigate to cloned dir:
-cd RelayKing/
+cd RelayKing-Depth/
 # Configure Python venv:
 virtualenv --python=python3 .
 source bin/activate
